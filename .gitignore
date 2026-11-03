@@ -3,5 +3,6 @@
 __pycache__/
 output/
 输出/
+state/
 .claude/
 .DS_Store

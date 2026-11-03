@@ -3,7 +3,7 @@ const form = $("form");
 
 const FIELDS = [
   "topic", "title_must_include", "comment_must_include", "output_dir", "max_videos", "max_comments", "order",
-  "language", "region", "published_after", "published_before", "include_replies",
+  "language", "region", "published_after", "published_before", "include_replies", "wait_for_quota",
 ];
 const MORE_FILTERS = ["language", "region", "published_after", "published_before", "include_replies"];
 const STORE_KEY = "comment-grabber:form";
@@ -14,7 +14,7 @@ const OUTCOMES = {
   failed: { title: "Something went wrong", tone: "error" },
 };
 
-let config = { daily_quota: 10000, can_pick_folder: false, can_reveal: false };
+let config = { daily_quota: 10000, can_pick_folder: false, can_reveal: false, quota_reset: "" };
 let running = false;
 let logCount = 0;
 let pollTimer = null;
@@ -92,6 +92,102 @@ function clearError() {
   $("formError").hidden = true;
 }
 
+function showQuota(used) {
+  const badge = $("quotaBadge");
+  badge.hidden = false;
+  badge.textContent = `Quota used today: ${fmt(used)} / ${fmt(config.daily_quota)}`;
+  badge.title = `Counted by this app only. Resets at ${config.quota_reset} your time.`;
+  badge.className = `badge ${used >= config.daily_quota ? "bad" : ""}`;
+}
+
+// ---- Unfinished jobs ----
+
+function describeJob(j) {
+  const parts = [];
+  if (!j.search_done) parts.push(`Search not finished (${fmt(j.videos_total)} videos found so far)`);
+  else parts.push(`${fmt(j.videos_done)} of ${fmt(j.videos_total)} videos done`);
+  parts.push(`${fmt(j.comments)} comments${j.replies ? ` and ${fmt(j.replies)} replies` : ""} saved`);
+  const when = new Date(j.updated);
+  if (!isNaN(when)) {
+    parts.push(`last run ${when.toLocaleString("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}`);
+  }
+  return parts.join(" · ");
+}
+
+function hint(text, extraClass = "") {
+  const el = document.createElement("span");
+  el.className = `hint ${extraClass}`.trim();
+  el.textContent = text;
+  return el;
+}
+
+function button(text, className, onClick) {
+  const el = document.createElement("button");
+  el.type = "button";
+  el.className = `btn btn-small ${className}`;
+  el.textContent = text;
+  el.addEventListener("click", onClick);
+  return el;
+}
+
+async function loadJobs() {
+  let list = [];
+  try {
+    list = (await api("/api/jobs")).jobs;
+  } catch {}
+  $("jobsCard").hidden = running || list.length === 0;
+  $("jobList").replaceChildren(...list.map((j) => {
+    const li = document.createElement("li");
+    li.className = "job";
+    const main = document.createElement("div");
+    main.className = "job-main";
+    const title = document.createElement("strong");
+    title.textContent = j.topic;
+    main.append(title);
+    const filters = [
+      j.title_must_include && `Titles: ${j.title_must_include}`,
+      j.comment_must_include && `Comments: ${j.comment_must_include}`,
+    ].filter(Boolean);
+    if (filters.length) main.append(hint(filters.join(" · ")));
+    main.append(hint(describeJob(j)));
+    if (j.comments + j.replies > 0 && !j.csv_exists) {
+      main.append(hint("The CSV file has been moved or deleted; new comments will go into a new file", "warn-text"));
+    }
+    const actions = document.createElement("div");
+    actions.className = "job-actions";
+    actions.append(
+      button("Continue", "btn-primary", () => resumeJob(j.job_id)),
+      button("Discard", "btn-secondary", () => discardJob(j)),
+    );
+    li.append(main, actions);
+    return li;
+  }));
+}
+
+async function resumeJob(jobId) {
+  clearError();
+  try {
+    await api("/api/resume", { job_id: jobId, wait_for_quota: form.wait_for_quota.checked });
+  } catch (e) {
+    showError(e.message);
+    loadJobs();
+    return;
+  }
+  startPolling();
+  $("progressCard").scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+async function discardJob(j) {
+  const ok = confirm(`Discard the unfinished job "${j.topic}"?\n\nYou won't be able to continue it. Comments it already saved stay in their files.`);
+  if (!ok) return;
+  try {
+    await api("/api/discard", { job_id: j.job_id });
+  } catch (e) {
+    showError(e.message);
+  }
+  loadJobs();
+}
+
 // ---- Progress ----
 
 function setRunning(next) {
@@ -102,6 +198,16 @@ function setRunning(next) {
   $("stopBtn").hidden = !next;
   $("stopBtn").disabled = false;
   $("stopBtn").textContent = "Stop";
+  if (next) $("jobsCard").hidden = true;
+  else loadJobs();
+}
+
+function startPolling() {
+  logCount = 0;
+  $("logList").replaceChildren();
+  $("result").hidden = true;
+  setRunning(true);
+  poll();
 }
 
 function appendLogs(logs) {
@@ -125,13 +231,18 @@ function render(s) {
   appendLogs(s.logs);
   logCount = s.log_count;
 
-  const searching = s.running && p.videos_total === 0;
+  showQuota(s.quota_today);
+  const searching = s.running && p.videos_total === 0 && !p.waiting_until;
   const bar = $("bar");
   bar.classList.toggle("indeterminate", searching);
   bar.classList.toggle("done", !s.running && s.result?.status === "done");
   $("barFill").style.width = searching ? "" : `${p.videos_total ? (p.videos_done / p.videos_total) * 100 : 0}%`;
   $("progressText").textContent = p.videos_total ? `${p.videos_done} / ${p.videos_total} videos` : "";
-  $("currentVideo").textContent = s.running && p.current_video ? `Now fetching: ${p.current_video}` : "";
+  if (p.waiting_until) {
+    $("currentVideo").textContent = `Continuing automatically at ${p.waiting_until} (your time). Keep the app open and the computer awake.`;
+  } else {
+    $("currentVideo").textContent = s.running && p.current_video ? `Now fetching: ${p.current_video}` : "";
+  }
 
   const filtering = s.filtering_comments;
   $("statCommentsLabel").textContent = filtering ? "Matching comments" : "Comments";
@@ -144,7 +255,8 @@ function render(s) {
   $("statQuota").textContent = fmt(p.quota_used);
 
   if (s.running) {
-    $("phase").textContent = searching ? "Searching for videos…" : "Fetching comments…";
+    $("phase").textContent = p.waiting_until ? "Waiting for the quota to reset…"
+      : searching ? "Searching for videos…" : "Fetching comments…";
     $("result").hidden = true;
   } else if (s.result) {
     showResult(s.result);
@@ -208,11 +320,7 @@ form.addEventListener("submit", async (event) => {
   } finally {
     $("startBtn").disabled = false;
   }
-  logCount = 0;
-  $("logList").replaceChildren();
-  $("result").hidden = true;
-  setRunning(true);
-  poll();
+  startPolling();
 });
 
 $("stopBtn").addEventListener("click", async () => {
@@ -267,6 +375,8 @@ async function init() {
   badge.textContent = config.key_ready ? "API key set" : "No API key";
   badge.className = `badge ${config.key_ready ? "ok" : "bad"}`;
   $("keyWarning").hidden = config.key_ready;
+  $("waitHint").textContent = `Keep the app open and the computer awake; the quota resets at ${config.quota_reset} your time. Also applies when you continue an unfinished job.`;
+  showQuota(config.quota_today);
   updateHints();
 
   // If a job is still running (or just finished) when the page is reloaded, show it again
@@ -276,6 +386,7 @@ async function init() {
     setRunning(s.running);
     if (s.running) poll();
   }
+  if (!running) loadJobs();
 }
 
 init();

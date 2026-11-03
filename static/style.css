@@ -58,6 +58,7 @@ h1 { margin: 0; font-size: 28px; letter-spacing: 0.02em; }
   flex-shrink: 0; margin-top: 6px; padding: 4px 10px; border-radius: 999px;
   font-size: 13px; white-space: nowrap; background: var(--surface-2); color: var(--muted);
 }
+.badges { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; flex-shrink: 0; }
 .badge.ok { background: var(--success-soft); color: var(--success); }
 .badge.bad { background: var(--warn-soft); color: var(--warn); }
 
@@ -136,6 +137,19 @@ h2 { margin: 0; font-size: 18px; }
 .files .hint { display: inline-block; min-width: 3.5em; }
 .files code { background: transparent; padding: 0; word-break: break-all; }
 
+.jobs-intro { margin: 4px 0 14px; }
+.jobs { display: grid; gap: 10px; margin: 0; padding: 0; list-style: none; }
+.job {
+  display: flex; align-items: center; justify-content: space-between; gap: 16px;
+  padding: 12px 14px; border: 1px solid var(--border); border-radius: 10px;
+}
+.job-main { display: grid; gap: 2px; min-width: 0; }
+.job-main strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.job-main .hint { overflow-wrap: anywhere; }
+.job-main .warn-text { color: var(--warn); }
+.job-actions { display: flex; gap: 8px; flex-shrink: 0; }
+.btn-small { height: 34px; padding: 0 14px; font-size: 14px; }
+
 .log { margin-top: 18px; }
 .log ol {
   max-height: 280px; margin: 10px 0 0; padding: 10px 12px; overflow: auto; list-style: none;
@@ -151,7 +165,10 @@ h2 { margin: 0; font-size: 18px; }
 @media (max-width: 640px) {
   .wrap { padding-top: 24px; }
   .masthead { flex-direction: column; gap: 8px; }
+  .badges { flex-direction: row; flex-wrap: wrap; align-items: flex-start; }
   .badge { margin-top: 0; }
+  .job { flex-direction: column; align-items: stretch; }
+  .job-actions .btn { flex: 1; }
   .card { padding: 18px; }
   .grid-3, .grid-2 { grid-template-columns: 1fr; }
   .stats { grid-template-columns: repeat(2, 1fr); }

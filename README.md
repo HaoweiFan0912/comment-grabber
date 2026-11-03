@@ -26,7 +26,17 @@ Or run it from a terminal:
 .venv/bin/python cli.py "camping gear" ~/Desktop/comments --videos 50 --comments 500 --title-has "tent review"
 ```
 
-Run it without arguments to be asked for the topic and folder. Use `--help` to see every option (sort order, keyword filters, language, region, date range, replies).
+Run it without arguments to be asked for the topic and folder. Use `--help` to see every option (sort order, keyword filters, language, region, date range, replies, waiting for the quota).
+
+## Big jobs: continuing over several days
+
+Progress is saved after every page of results, so a job that stops for any reason (you press Stop, the daily quota runs out, the network drops, you close the app) can be continued later:
+
+- **Web UI:** stopped jobs appear under **Unfinished jobs**. Press **Continue** to pick up where it left off. It doesn't search again (the video list is saved) and never saves the same comment twice; new comments are added to the same CSV and the Excel file is rebuilt.
+- **Command line:** `.venv/bin/python cli.py --resume` lists unfinished jobs and continues one.
+- **Wait for the quota automatically:** tick *If the daily quota runs out, wait for it to reset and keep going* (or pass `--wait`). The app then waits until the quota resets (midnight Pacific Time) and carries on by itself. Keep the app open and the computer awake.
+
+Saved progress lives in the `state/` folder. **Discard** forgets an unfinished job but keeps the comment files it already saved.
 
 ## Keyword filters
 
@@ -60,4 +70,10 @@ The YouTube API allows 10,000 quota units per day, reset at midnight Pacific Tim
 - Comments: 1 unit per 100 comments
 - Replies: 1 extra unit per 100 replies, for comments with more than 5 replies
 
-The defaults (50 videos × 500 comments) use at most about 350 units. A title filter can add up to 900 more for extra search pages. If the quota runs out midway, everything fetched so far is kept.
+The defaults (50 videos × 500 comments) use at most about 350 units. A title filter can add up to 900 more for extra search pages. Searching is the expensive part: after searching 500 videos (1,000 units) there's enough left to check about 900,000 comments the same day.
+
+The header shows how much quota this app has used today. It can't see use of the same key by other apps.
+
+If you regularly need more, apply for a higher quota with Google's *YouTube API Services Audit and Quota Extension Form*. Don't rotate several API keys or Google Cloud projects to get around the limit: YouTube's API policies forbid it, and keys can be suspended.
+
+A single search only reaches about 500 videos, whatever your quota. For more videos on one topic, split the job by date range or use several related topics.

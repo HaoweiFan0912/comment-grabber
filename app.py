@@ -28,10 +28,12 @@ from fetcher import (
     FetchOptions,
     load_api_key,
 )
+from jobs import Checkpoint, next_quota_reset, quota_used_today, unfinished_jobs
 
 HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 IS_MAC = sys.platform == "darwin"
+NO_KEY_MESSAGE = "No API key yet: set YOUTUBE_API_KEY in .env, save it, and try again"
 
 PICK_FOLDER_SCRIPT = """
 on run argv
@@ -57,13 +59,13 @@ class Job:
         self.logs: list = []
         self.running = False
 
-    def start(self, api_key: str, options: FetchOptions) -> bool:
+    def start(self, fetcher: CommentFetcher) -> bool:
         with self.lock:
             if self.running:
                 return False
             self.running = True
             self.logs = []
-            self.fetcher = CommentFetcher(api_key, options, log=self.add_log)
+            self.fetcher = fetcher
         threading.Thread(target=self._run, daemon=True).start()
         return True
 
@@ -98,7 +100,12 @@ class Job:
                 "progress": asdict(fetcher.progress) if fetcher else None,
                 "result": asdict(fetcher.result) if fetcher and not self.running else None,
                 "filtering_comments": bool(fetcher and fetcher.options.comment_must_include),
+                "quota_today": quota_used_today(),
             }
+
+    def running_job_id(self) -> Optional[str]:
+        with self.lock:
+            return self.fetcher.job_id if self.running else None
 
     def last_file(self) -> Optional[str]:
         with self.lock:
@@ -134,7 +141,15 @@ def config():
         max_comments=MAX_COMMENTS_LIMIT,
         can_pick_folder=IS_MAC,
         can_reveal=IS_MAC,
+        quota_today=quota_used_today(),
+        quota_reset=f"{next_quota_reset().astimezone():%H:%M}",
     )
+
+
+@app.get("/api/jobs")
+def list_jobs():
+    running = job.running_job_id()
+    return jsonify(jobs=[cp.summary() for cp in unfinished_jobs() if cp.job_id != running])
 
 
 @app.get("/api/status")
@@ -154,9 +169,38 @@ def start():
         return jsonify(error=str(e)), 400
     api_key = load_api_key()
     if not api_key:
-        return jsonify(error="No API key yet: set YOUTUBE_API_KEY in .env, save it, and try again"), 400
-    if not job.start(api_key, options):
+        return jsonify(error=NO_KEY_MESSAGE), 400
+    if not job.start(CommentFetcher(api_key, options, log=job.add_log)):
         return jsonify(error="A job is already running"), 409
+    return jsonify(ok=True)
+
+
+@app.post("/api/resume")
+def resume():
+    data = request.get_json(silent=True) or {}
+    api_key = load_api_key()
+    if not api_key:
+        return jsonify(error=NO_KEY_MESSAGE), 400
+    try:
+        fetcher = CommentFetcher.resume(api_key, str(data.get("job_id", "")), log=job.add_log,
+                                        wait_for_quota=bool(data.get("wait_for_quota", False)))
+    except ValueError as e:
+        return jsonify(error=str(e)), 404
+    if not job.start(fetcher):
+        return jsonify(error="A job is already running"), 409
+    return jsonify(ok=True)
+
+
+@app.post("/api/discard")
+def discard():
+    """Forget an unfinished job. The comment files it already saved are kept."""
+    job_id = str((request.get_json(silent=True) or {}).get("job_id", ""))
+    if job_id == job.running_job_id():
+        return jsonify(error="That job is running right now"), 409
+    try:
+        Checkpoint.load(job_id).delete()
+    except ValueError as e:
+        return jsonify(error=str(e)), 404
     return jsonify(ok=True)
 
 

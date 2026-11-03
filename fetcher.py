@@ -1,6 +1,8 @@
 """Search YouTube for a topic and save the comments from the matching videos.
 
 Comments are written to a CSV file as they arrive, and an Excel copy is made at the end.
+Progress is saved after every page, so a job that stops (Stop button, quota used up, network
+down...) can be continued later without searching again or saving duplicates.
 Both the web UI (app.py) and the command line (cli.py) use CommentFetcher.
 """
 
@@ -11,14 +13,15 @@ import html
 import os
 import re
 import threading
-from dataclasses import dataclass
-from datetime import date, datetime
+from dataclasses import asdict, dataclass, fields
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
 import requests
 from dotenv import dotenv_values
 
+from jobs import Checkpoint, add_quota, next_quota_reset, unfinished_jobs
 from keywords import Keywords
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -77,6 +80,7 @@ class FetchOptions:
     include_replies: bool = False
     title_must_include: str = ""  # keywords, see keywords.py
     comment_must_include: str = ""
+    wait_for_quota: bool = False  # when the daily quota runs out, wait for the reset and keep going
 
     @classmethod
     def from_dict(cls, data: dict) -> FetchOptions:
@@ -94,6 +98,7 @@ class FetchOptions:
                 include_replies=bool(data.get("include_replies", False)),
                 title_must_include=str(data.get("title_must_include", "")).strip(),
                 comment_must_include=str(data.get("comment_must_include", "")).strip(),
+                wait_for_quota=bool(data.get("wait_for_quota", False)),
             )
         except (TypeError, ValueError):
             raise ValueError("Max videos and comments per video must be whole numbers") from None
@@ -118,14 +123,15 @@ class FetchOptions:
 @dataclass
 class Progress:
     videos_total: int = 0
-    videos_done: int = 0  # processed videos, including skipped ones
+    videos_done: int = 0  # finished videos, including skipped ones
     videos_skipped: int = 0
     videos_title_rejected: int = 0  # search results dropped because the title didn't match
     comments_scanned: int = 0  # top-level comments looked at
     comments: int = 0  # top-level comments saved
     replies: int = 0  # replies saved
-    quota_used: int = 0
+    quota_used: int = 0  # by this job, over all its runs
     current_video: str = ""
+    waiting_until: str = ""  # local time the job resumes at, while waiting for the quota to reset
 
 
 @dataclass
@@ -134,10 +140,16 @@ class FetchResult:
     message: str = ""
     output_path: Optional[str] = None  # CSV
     excel_path: Optional[str] = None
+    resumable: bool = False  # saved as an unfinished job that can be continued
+    job_id: Optional[str] = None
 
 
 class FatalError(Exception):
-    """An error that ends the whole job (quota used up, bad API key, network down...). What was saved is kept."""
+    """An error that ends the run (bad API key, network down...). Saved comments and progress are kept."""
+
+
+class QuotaExceeded(FatalError):
+    """The daily quota is used up."""
 
 
 class ApiError(Exception):
@@ -173,15 +185,15 @@ class ApiError(Exception):
             self.reasons & {"rateLimitExceeded", "userRateLimitExceeded", "backendError"}
         )
 
-    def fatal_message(self) -> Optional[str]:
+    def fatal_error(self) -> Optional[FatalError]:
         if self.reasons & {"quotaExceeded", "dailyLimitExceeded"}:
-            return "Today's API quota is used up (it resets at midnight Pacific Time)"
+            return QuotaExceeded("Today's API quota is used up (it resets at midnight Pacific Time)")
         if self.reasons & {"keyInvalid", "API_KEY_INVALID"} or "API key not valid" in self.message:
-            return "The API key is invalid — check YOUTUBE_API_KEY in .env"
+            return FatalError("The API key is invalid — check YOUTUBE_API_KEY in .env")
         if self.reasons & {"accessNotConfigured", "SERVICE_DISABLED"}:
-            return "YouTube Data API v3 isn't enabled in the Google Cloud project this API key belongs to"
+            return FatalError("YouTube Data API v3 isn't enabled in the Google Cloud project this API key belongs to")
         if self.reasons & {"keyExpired", "ipRefererBlocked"} or any(r.startswith("API_KEY_") for r in self.reasons):
-            return "This API key has expired or is restricted — check it in the Google Cloud console"
+            return FatalError("This API key has expired or is restricted — check it in the Google Cloud console")
         return None
 
     def __str__(self) -> str:
@@ -196,11 +208,14 @@ class _Stopped(Exception):
 
 
 class CommentFetcher:
-    def __init__(self, api_key: str, options: FetchOptions, log: Optional[Log] = None):
+    def __init__(self, api_key: str, options: FetchOptions, log: Optional[Log] = None,
+                 checkpoint: Optional[Checkpoint] = None):
         self.api_key = api_key
         self.options = options
-        self.progress = Progress()
-        self.result = FetchResult()
+        self.cp = checkpoint  # None until a new job has picked its file name
+        self.resumed = checkpoint is not None
+        self.progress = _restore_progress(checkpoint.progress) if checkpoint else Progress()
+        self.result = FetchResult(output_path=checkpoint.csv_path if checkpoint else None)
         self._log = log or (lambda level, message: None)
         self._title_kw = Keywords(options.title_must_include)
         self._comment_kw = Keywords(options.comment_must_include)
@@ -211,61 +226,91 @@ class CommentFetcher:
             self._session.proxies = {"http": proxy, "https": proxy}
         self._out = None
         self._writer = None
+        self._entry_index = 0  # first video handled since the last (re)start, which may be half done
+        self._saved_ids: set = set()  # comment IDs already in the CSV for the current video
+
+    @classmethod
+    def resume(cls, api_key: str, job_id: str, log: Optional[Log] = None,
+               wait_for_quota: Optional[bool] = None) -> CommentFetcher:
+        checkpoint = Checkpoint.load(job_id)
+        options = FetchOptions.from_dict(checkpoint.options)
+        if wait_for_quota is not None:
+            options.wait_for_quota = wait_for_quota
+        return cls(api_key, options, log=log, checkpoint=checkpoint)
+
+    @property
+    def job_id(self) -> Optional[str]:
+        return self.cp.job_id if self.cp else None
 
     def stop(self) -> None:
         """Ask the job to stop; it stops once the request in progress finishes."""
         self._stop.set()
 
     def run(self) -> FetchResult:
-        try:
-            self._run()
-        except (_Stopped, KeyboardInterrupt):
-            status, message = "stopped", "Stopped"
-        except FatalError as e:
-            status, message = "failed", str(e)
-        else:
-            status, message = "done", "Done"
-
-        if self.result.output_path:
-            self._export_excel()
-            message += ". " + self._summary()
-        elif status == "done":
-            status, message = "empty", self._empty_message()
-        return self._finish(status, message)
+        if self.resumed:
+            self._log("info", self._resume_message())
+        while True:
+            try:
+                self._run()
+            except QuotaExceeded as e:
+                if self.options.wait_for_quota:
+                    try:
+                        self._wait_for_quota_reset()
+                        continue
+                    except (_Stopped, KeyboardInterrupt):
+                        status, message = "stopped", "Stopped"
+                else:
+                    status, message = "failed", str(e)
+            except (_Stopped, KeyboardInterrupt):
+                status, message = "stopped", "Stopped"
+            except FatalError as e:
+                status, message = "failed", str(e)
+            else:
+                status, message = "done", "Done"
+            break
+        return self._end(status, message)
 
     def _run(self) -> None:
-        opts = self.options
+        opts, p = self.options, self.progress
         folder = _prepare_folder(opts.output_dir)
-        self._log("info", f'Searching YouTube for "{opts.topic}"…')
-        if self._title_kw:
-            self._log("info", f"Titles must include: {self._title_kw}")
-        if self._comment_kw:
-            self._log("info", f"Comments must include: {self._comment_kw}")
-        videos = self._search_videos()
-        if not videos:
-            return
+        if self.cp is None:
+            taken = {job.csv_path for job in unfinished_jobs()}
+            self.cp = Checkpoint.new(asdict(opts), str(_new_file_path(folder, opts.topic, taken)))
+            self.result.output_path = self.cp.csv_path
+            self._log("info", f'Searching YouTube for "{opts.topic}"…')
+            if self._title_kw:
+                self._log("info", f"Titles must include: {self._title_kw}")
+            if self._comment_kw:
+                self._log("info", f"Comments must include: {self._comment_kw}")
+        cp = self.cp
 
-        p = self.progress
-        p.videos_total = len(videos)
-        notes = []
-        if len(videos) < opts.max_videos:
-            notes.append("that's all the search returned")
-        if p.videos_title_rejected:
-            notes.append(f"{p.videos_title_rejected:,} skipped because the title didn't match")
-        note = f" ({'; '.join(notes)})" if notes else ""
-        self._log("info", f"Found {_count(len(videos), 'video')}{note}. Fetching comments…")
+        if not cp.search_done:
+            self._search_videos()
+            if not cp.videos:
+                return
+            notes = []
+            if len(cp.videos) < opts.max_videos:
+                notes.append("that's all the search returned")
+            if p.videos_title_rejected:
+                notes.append(f"{p.videos_title_rejected:,} skipped because the title didn't match")
+            note = f" ({'; '.join(notes)})" if notes else ""
+            self._log("info", f"Found {_count(len(cp.videos), 'video')}{note}. Fetching comments…")
+        p.videos_total = len(cp.videos)
 
-        path = _new_file_path(folder, opts.topic)
-        self.result.output_path = str(path)
-        with open(path, "w", newline="", encoding="utf-8-sig") as self._out:
+        self._entry_index = cp.video_index
+        with open(cp.csv_path, "a", newline="", encoding="utf-8-sig") as self._out:
             self._writer = csv.DictWriter(self._out, fieldnames=CSV_COLUMNS)
-            self._writer.writeheader()
-            for index, video in enumerate(videos, 1):
+            if self._out.tell() == 0:
+                self._writer.writeheader()
+            while cp.video_index < len(cp.videos):
                 self._check_stop()
-                self._process_video(index, video)
+                self._process_video(cp.video_index)
+                cp.video_index += 1
+                cp.video_page_token, cp.video_scanned = "", 0
+                self._save_checkpoint()
 
-    def _search_videos(self) -> list:
-        opts = self.options
+    def _search_videos(self) -> None:
+        cp, opts, p = self.cp, self.options, self.progress
         query = opts.topic
         if self._title_kw:
             # Searching for the title keywords too makes matching titles more likely, so fewer pages are needed
@@ -281,14 +326,18 @@ class CommentFetcher:
             "publishedAfter": f"{opts.published_after}T00:00:00Z" if opts.published_after else "",
             "publishedBefore": f"{opts.published_before}T23:59:59Z" if opts.published_before else "",
         }
-        videos = {}
-        seen = set()
-        page_token = ""
-        while len(videos) < opts.max_videos:
+        seen = set(cp.seen_video_ids)
+        restarted = False
+        while len(cp.videos) < opts.max_videos:
             self._check_stop()
             try:
-                data = self._get("search", {**params, "pageToken": page_token}, cost=SEARCH_COST)
+                data = self._get("search", {**params, "pageToken": cp.search_page_token}, cost=SEARCH_COST)
             except ApiError as e:
+                if cp.search_page_token and e.status == 400 and not restarted:
+                    # Saved positions in search results can expire; videos already found are kept
+                    self._log("warn", "The saved position in the search results has expired; searching again from the start")
+                    cp.search_page_token, restarted = "", True
+                    continue
                 raise FatalError(f"Search failed: {e}") from None
             items = data.get("items", [])
             for item in items:
@@ -296,28 +345,35 @@ class CommentFetcher:
                 if not video_id or video_id in seen:
                     continue
                 seen.add(video_id)
+                cp.seen_video_ids.append(video_id)
                 snippet = item.get("snippet", {})
                 # Search results come with HTML entities in titles, e.g. &#39;
                 title = html.unescape(snippet.get("title", ""))
                 if not self._title_kw.match(title):
-                    self.progress.videos_title_rejected += 1
+                    p.videos_title_rejected += 1
                     continue
-                videos[video_id] = {
+                cp.videos.append({
                     "id": video_id,
                     "title": title,
                     "channel": html.unescape(snippet.get("channelTitle", "")),
-                }
+                })
             if self._title_kw:
-                self._log("info", f"Checked {_count(len(seen), 'search result')}, {len(videos):,} with matching titles")
-            page_token = data.get("nextPageToken", "")
-            if not items or not page_token:
+                self._log("info", f"Checked {_count(len(seen), 'search result')}, {len(cp.videos):,} with matching titles")
+            cp.search_page_token = data.get("nextPageToken", "")
+            if not items or not cp.search_page_token:
                 break
-        return list(videos.values())[: opts.max_videos]
+            self._save_checkpoint()
+        del cp.videos[opts.max_videos:]
+        cp.search_done = True
+        self._save_checkpoint()
 
-    def _process_video(self, index: int, video: dict) -> None:
-        p = self.progress
+    def _process_video(self, index: int) -> None:
+        cp, p = self.cp, self.progress
+        video = cp.videos[index]
         p.current_video = video["title"]
-        label = f'[{index}/{p.videos_total}] "{video["title"]}"'
+        label = f'[{index + 1}/{len(cp.videos)}] "{video["title"]}"'
+        # Only the first video after a (re)start can already have rows in the CSV
+        self._saved_ids = self._load_saved_ids(video["id"]) if index == self._entry_index else set()
         scanned_before, comments_before, replies_before = p.comments_scanned, p.comments, p.replies
 
         def stats() -> str:
@@ -328,15 +384,14 @@ class CommentFetcher:
         try:
             self._fetch_comments(video)
         except ApiError as e:
-            if p.comments_scanned == scanned_before:
+            if cp.video_scanned == 0:
                 p.videos_skipped += 1
                 self._log("warn", f"{label} skipped: {e}")
             else:
                 self._log("warn", f"{label} interrupted ({e}) after {stats()}")
         except (_Stopped, FatalError, KeyboardInterrupt):
             if p.comments_scanned > scanned_before:
-                p.videos_done += 1
-                self._log("info", f"{label} stopped partway: {stats()}")
+                self._log("info", f"{label} paused partway: {stats()}")
             raise
         else:
             self._log("info", f"{label} {stats()}")
@@ -354,7 +409,7 @@ class CommentFetcher:
         return text
 
     def _fetch_comments(self, video: dict) -> None:
-        opts = self.options
+        cp, opts, p = self.cp, self.options, self.progress
         params = {
             "part": "snippet,replies" if opts.include_replies else "snippet",
             "videoId": video["id"],
@@ -362,27 +417,43 @@ class CommentFetcher:
             "order": "relevance",
             "textFormat": "plainText",
         }
-        scanned = 0
-        page_token = ""
-        while scanned < opts.max_comments:
+        restarted = False
+        while cp.video_scanned < opts.max_comments:
             self._check_stop()
-            data = self._get("commentThreads", {**params, "pageToken": page_token})
-            for thread in data.get("items", []):
-                if scanned >= opts.max_comments:
-                    break
-                scanned += 1
-                self.progress.comments_scanned += 1
-                snippet = thread["snippet"]
-                top = snippet["topLevelComment"]
-                rows = []
-                if self._comment_kw.match(top.get("snippet", {}).get("textDisplay", "")):
-                    rows.append(self._row(video, top, "comment", reply_count=snippet.get("totalReplyCount", 0)))
-                # Replies are checked on their own, whether or not the comment above them matched
-                rows += self._replies(video, thread)
-                self._write(rows)
-            page_token = data.get("nextPageToken", "")
-            if not page_token:
+            try:
+                data = self._get("commentThreads", {**params, "pageToken": cp.video_page_token})
+            except ApiError as e:
+                if not (cp.video_page_token and e.status == 400 and not restarted):
+                    raise
+                # Saved positions can expire; start the video over (comments already saved are skipped)
+                self._log("warn", "The saved position in this video's comments has expired; checking it again from the start")
+                p.comments_scanned -= cp.video_scanned
+                cp.video_page_token, cp.video_scanned, restarted = "", 0, True
+                continue
+            page_start = cp.video_scanned
+            try:
+                for thread in data.get("items", []):
+                    if cp.video_scanned >= opts.max_comments:
+                        break
+                    cp.video_scanned += 1
+                    p.comments_scanned += 1
+                    snippet = thread["snippet"]
+                    top = snippet["topLevelComment"]
+                    rows = []
+                    if self._comment_kw.match(top.get("snippet", {}).get("textDisplay", "")):
+                        rows.append(self._row(video, top, "comment", reply_count=snippet.get("totalReplyCount", 0)))
+                    # Replies are checked on their own, whether or not the comment above them matched
+                    rows += self._replies(video, thread)
+                    self._write(rows)
+            except BaseException:
+                # This page will be fetched again next time, so it doesn't count as checked yet
+                p.comments_scanned -= cp.video_scanned - page_start
+                cp.video_scanned = page_start
+                raise
+            cp.video_page_token = data.get("nextPageToken", "")
+            if not cp.video_page_token:
                 break
+            self._save_checkpoint()
 
     def _replies(self, video: dict, thread: dict) -> list:
         total = thread["snippet"].get("totalReplyCount", 0)
@@ -438,12 +509,22 @@ class CommentFetcher:
 
     def _write(self, rows: Iterable[dict]) -> None:
         for row in rows:
+            if row["Comment ID"] in self._saved_ids:
+                continue  # already saved before a stop or restart
+            self._saved_ids.add(row["Comment ID"])
             self._writer.writerow(row)
             if row["Type"] == "comment":
                 self.progress.comments += 1
             else:
                 self.progress.replies += 1
-        self._out.flush()  # write as we go, so nothing fetched is lost if the job fails midway
+        self._out.flush()  # on disk before the checkpoint says this page is done
+
+    def _load_saved_ids(self, video_id: str) -> set:
+        path = Path(self.cp.csv_path)
+        if not path.exists():
+            return set()
+        with open(path, newline="", encoding="utf-8-sig") as f:
+            return {row["Comment ID"] for row in csv.DictReader(f) if row.get("Video ID") == video_id}
 
     def _get(self, endpoint: str, params: dict, cost: int = LIST_COST) -> dict:
         params = {k: v for k, v in params.items() if v not in (None, "")}
@@ -458,15 +539,16 @@ class CommentFetcher:
                 problem = f"Network error ({type(e).__name__})"
             else:
                 self.progress.quota_used += cost
+                add_quota(cost)
                 if resp.ok:
                     try:
                         return resp.json()
                     except ValueError:
                         raise ApiError(resp.status_code, set(), "YouTube sent a response that couldn't be read") from None
                 error = ApiError.from_response(resp)
-                fatal = error.fatal_message()
+                fatal = error.fatal_error()
                 if fatal:
-                    raise FatalError(fatal)
+                    raise fatal
                 if not error.retryable or attempt == MAX_RETRIES:
                     raise error
                 problem = f"YouTube had a temporary error ({resp.status_code})"
@@ -480,6 +562,63 @@ class CommentFetcher:
         if self._stop.is_set():
             raise _Stopped
 
+    def _wait_for_quota_reset(self) -> None:
+        self._save_checkpoint()
+        resume_at = next_quota_reset() + timedelta(minutes=5)  # a little slack after the reset
+        local = resume_at.astimezone()
+        when = f"{local:%H:%M}" + (" tomorrow" if local.date() != datetime.now().date() else "")
+        self.progress.current_video = ""
+        self.progress.waiting_until = when
+        self._log("warn", f"Today's quota is used up. Waiting until {when} (your time), after it resets, "
+                          "then continuing automatically. Keep the app open and the computer awake")
+        # Wait in short steps against the wall clock, so time the computer spends asleep still counts
+        while True:
+            remaining = (resume_at - datetime.now(timezone.utc)).total_seconds()
+            if remaining <= 0:
+                break
+            if self._stop.wait(min(remaining, 60)):
+                raise _Stopped
+        self.progress.waiting_until = ""
+        self._log("info", "The quota has reset. Continuing…")
+
+    def _save_checkpoint(self) -> None:
+        self.cp.progress = asdict(self.progress)
+        self.cp.save()
+
+    def _end(self, status: str, message: str) -> FetchResult:
+        cp, p = self.cp, self.progress
+        p.waiting_until = ""
+        csv_exists = bool(self.result.output_path) and Path(self.result.output_path).exists()
+        if status == "done" and not csv_exists:
+            status, message = "empty", self._empty_message()
+        # Worth continuing only if the search got somewhere
+        resumable = status in ("stopped", "failed") and cp is not None and bool(cp.seen_video_ids)
+        if cp is not None:
+            if resumable:
+                self._save_checkpoint()
+            else:
+                cp.delete()
+        if csv_exists:
+            self._export_excel()
+            message += ". " + self._summary()
+        else:
+            self.result.output_path = None
+        if resumable:
+            message += ". You can continue this job later"
+            self.result.resumable, self.result.job_id = True, cp.job_id
+        return self._finish(status, message)
+
+    def _resume_message(self) -> str:
+        cp, p = self.cp, self.progress
+        if not cp.search_done:
+            text = f'Continuing "{cp.options.get("topic")}": picking the search back up ({len(cp.videos):,} matching videos so far)…'
+        else:
+            text = (f'Continuing "{cp.options.get("topic")}": {p.videos_done:,} of {_count(len(cp.videos), "video")} '
+                    f"finished, {_count(p.comments, 'comment')} saved so far…")
+        if p.comments + p.replies and not Path(cp.csv_path).exists():
+            text += f" Note: the CSV file from earlier runs is missing, so new comments go into a new file at {cp.csv_path}"
+        return text
+
     def _export_excel(self) -> None:
         self._log("info", "Creating the Excel file…")
         try:
@@ -489,7 +628,9 @@ class CommentFetcher:
 
     def _summary(self) -> str:
         p = self.progress
-        parts = [f"Processed {_count(p.videos_done, 'video')}"]
+        total = len(self.cp.videos) if self.cp else p.videos_total
+        finished = _count(total, "video") if p.videos_done >= total else f"{p.videos_done:,} of {_count(total, 'video')}"
+        parts = [f"Finished {finished}"]
         if self._comment_kw:
             parts.append(f"checked {_count(p.comments_scanned, 'comment')}")
             saved = _count(p.comments, "matching comment")
@@ -517,6 +658,13 @@ class CommentFetcher:
         level = {"done": "success", "stopped": "warn", "empty": "warn"}.get(status, "error")
         self._log(level, message)
         return self.result
+
+
+def _restore_progress(data: dict) -> Progress:
+    known = {f.name for f in fields(Progress)}
+    progress = Progress(**{k: v for k, v in data.items() if k in known})
+    progress.current_video = progress.waiting_until = ""
+    return progress
 
 
 def csv_to_excel(csv_path: Path) -> Path:
@@ -574,12 +722,13 @@ def _prepare_folder(output_dir: str) -> Path:
     return folder
 
 
-def _new_file_path(folder: Path, topic: str) -> Path:
+def _new_file_path(folder: Path, topic: str, taken: set) -> Path:
+    """A file name that's not in use, and not reserved by an unfinished job that hasn't written yet."""
     name = re.sub(r'[\\/:*?"<>|\s]+', "_", topic).strip("._")[:40] or "youtube"
     stamp = datetime.now().strftime("%Y%m%d_%H%M")
     path = folder / f"{name}_{stamp}.csv"
     n = 2
-    while path.exists() or path.with_suffix(".xlsx").exists():
+    while path.exists() or path.with_suffix(".xlsx").exists() or str(path) in taken:
         path = folder / f"{name}_{stamp}_{n}.csv"
         n += 1
     return path

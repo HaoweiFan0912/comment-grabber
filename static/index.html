@@ -13,12 +13,21 @@
         <h1>Comment Grabber</h1>
         <p class="lede">Search YouTube for a topic and save the comments from the videos it finds as Excel and CSV files.</p>
       </div>
-      <span id="keyBadge" class="badge">Checking API key…</span>
+      <div class="badges">
+        <span id="keyBadge" class="badge">Checking API key…</span>
+        <span id="quotaBadge" class="badge" hidden></span>
+      </div>
     </header>
 
     <div id="keyWarning" class="notice notice-warn" hidden>
       No API key yet. Open the <code>.env</code> file in the project folder with a text editor, put your key after <code>YOUTUBE_API_KEY=</code>, save it, and reload this page.
     </div>
+
+    <section id="jobsCard" class="card" hidden>
+      <h2>Unfinished jobs</h2>
+      <p class="hint jobs-intro">These stopped before finishing: you pressed Stop, the quota ran out, or something went wrong. Continue picks up where a job left off, without searching again or saving anything twice.</p>
+      <ul id="jobList" class="jobs"></ul>
+    </section>
 
     <form id="form" class="card" novalidate>
       <fieldset id="fields">
@@ -73,6 +82,11 @@
             </select>
           </label>
         </div>
+
+        <label class="check">
+          <input type="checkbox" name="wait_for_quota" id="wait_for_quota">
+          <span>If the daily quota runs out, wait for it to reset and keep going<span class="hint" id="waitHint">Keep the app open and the computer awake. Also applies when you continue an unfinished job.</span></span>
+        </label>
 
         <details class="more" id="more">
           <summary>More filters</summary>
