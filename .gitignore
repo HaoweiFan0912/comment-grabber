@@ -1,0 +1,7 @@
+.env
+.venv/
+__pycache__/
+output/
+输出/
+.claude/
+.DS_Store
