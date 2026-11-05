@@ -14,6 +14,7 @@ from datetime import datetime
 from typing import Optional
 
 from fetcher import (
+    BATCH_SIZE,
     DEFAULT_OUTPUT_DIR,
     MAX_COMMENTS_LIMIT,
     MAX_VIDEOS_LIMIT,
@@ -45,7 +46,7 @@ def pick_job(choice: str) -> Optional[str]:
     print("Unfinished jobs:")
     for n, cp in enumerate(jobs, 1):
         s = cp.summary()
-        if s["search_done"]:
+        if s["search_done"] or s["batched"]:
             where = f"{s['videos_done']:,} of {s['videos_total']:,} videos done"
         else:
             where = f"search not finished ({s['videos_total']:,} videos found so far)"
@@ -70,7 +71,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Search YouTube for a topic and save the comments as CSV and Excel")
     parser.add_argument("topic", nargs="?", help="what to search for")
     parser.add_argument("output_dir", nargs="?", help=f"folder to save to (default {DEFAULT_OUTPUT_DIR})")
-    parser.add_argument("--videos", type=int, default=50, help=f"max videos, 1–{MAX_VIDEOS_LIMIT} (default 50)")
+    parser.add_argument("--videos", type=int, default=50,
+                        help=f"max videos, 1–{MAX_VIDEOS_LIMIT:,} (default 50); over {BATCH_SIZE} runs in batches")
     parser.add_argument("--comments", type=int, default=500,
                         help=f"comments per video, not counting replies, 1–{MAX_COMMENTS_LIMIT:,} (default 500); "
                              "with --comment-has, how many to check")

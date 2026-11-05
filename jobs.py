@@ -46,8 +46,16 @@ class Checkpoint:
     updated: str = ""
     search_done: bool = False
     search_page_token: str = ""
-    seen_video_ids: list = field(default_factory=list)
+    seen_video_ids: list = field(default_factory=list)  # every search result so far, so none is collected twice
     videos: list = field(default_factory=list)  # [{"id", "title", "channel"}]
+    batched: bool = False  # more videos than one search can reach: search in batches, over stretches of time
+    batch_end: int = 0  # videos before this index have been found; their comments come before the next search
+    batches_done: int = 0
+    search_range: list = field(default_factory=list)  # [first day, last day] the whole job covers
+    search_window: list = field(default_factory=list)  # [first day, last day] being searched; empty: the whole range
+    pending_windows: list = field(default_factory=list)  # windows still to search
+    saturated_windows: list = field(default_factory=list)  # searched windows that probably have more to show
+    window_results: int = 0  # search results seen in the current window
     video_index: int = 0  # the video being worked on
     video_page_token: str = ""  # next page of that video's comments; "" means its first page
     video_scanned: int = 0  # comments of that video already checked
@@ -91,7 +99,8 @@ class Checkpoint:
             "csv_exists": Path(self.csv_path).exists(),
             "updated": self.updated or self.created,
             "search_done": self.search_done,
-            "videos_total": len(self.videos),
+            "batched": self.batched,
+            "videos_total": o.get("max_videos", 0) if self.batched and not self.search_done else len(self.videos),
             "videos_done": p.get("videos_done", 0),
             "comments": p.get("comments", 0),
             "replies": p.get("replies", 0),

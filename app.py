@@ -20,6 +20,7 @@ from typing import Optional
 from flask import Flask, abort, jsonify, request
 
 from fetcher import (
+    BATCH_SIZE,
     DAILY_QUOTA,
     DEFAULT_OUTPUT_DIR,
     MAX_COMMENTS_LIMIT,
@@ -139,6 +140,7 @@ def config():
         daily_quota=DAILY_QUOTA,
         max_videos=MAX_VIDEOS_LIMIT,
         max_comments=MAX_COMMENTS_LIMIT,
+        batch_size=BATCH_SIZE,
         can_pick_folder=IS_MAC,
         can_reveal=IS_MAC,
         quota_today=quota_used_today(),

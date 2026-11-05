@@ -74,12 +74,19 @@ function updateHints() {
 
   const videos = Math.max(0, Math.floor(Number(form.max_videos.value)) || 0);
   const comments = Math.max(0, Math.floor(Number(form.max_comments.value)) || 0);
-  // Search costs 100 per page of 50 results (a title filter may page through all ~10 pages); comments cost 1 per 100
-  const searchPages = form.title_must_include.value.trim() ? 10 : Math.ceil(videos / 50);
+  const batched = videos > config.batch_size;
+  $("maxVideosHint").hidden = !batched;
+  // Search costs 100 per page of 50 results; comments cost 1 per 100. A title filter may page through all
+  // ~10 pages of a search, and batches repeat some videos, which costs extra pages to skip past.
+  const titleFilter = form.title_must_include.value.trim() !== "";
+  const pages = Math.ceil(videos / 50);
+  const searchPages = batched ? Math.ceil(pages * (titleFilter ? 3 : 1.5)) : titleFilter ? 10 : pages;
   const units = searchPages * 100 + videos * Math.ceil(comments / 100);
   const replies = form.include_replies.checked ? " plus replies" : "";
+  const days = Math.ceil(units / config.daily_quota);
+  const dayNote = days > 1 ? `, about ${days} days' worth` : "";
   const el = $("estimate");
-  el.textContent = `Uses up to about ${fmt(units)} quota units${replies} (daily limit ${fmt(config.daily_quota)})`;
+  el.textContent = `Uses up to about ${fmt(units)} quota units${replies}${dayNote} (daily limit ${fmt(config.daily_quota)})`;
   el.classList.toggle("over", units > config.daily_quota);
 }
 
@@ -104,7 +111,7 @@ function showQuota(used) {
 
 function describeJob(j) {
   const parts = [];
-  if (!j.search_done) parts.push(`Search not finished (${fmt(j.videos_total)} videos found so far)`);
+  if (!j.search_done && !j.batched) parts.push(`Search not finished (${fmt(j.videos_total)} videos found so far)`);
   else parts.push(`${fmt(j.videos_done)} of ${fmt(j.videos_total)} videos done`);
   parts.push(`${fmt(j.comments)} comments${j.replies ? ` and ${fmt(j.replies)} replies` : ""} saved`);
   const when = new Date(j.updated);
@@ -232,12 +239,13 @@ function render(s) {
   logCount = s.log_count;
 
   showQuota(s.quota_today);
-  const searching = s.running && p.videos_total === 0 && !p.waiting_until;
+  const searching = s.running && p.searching && !p.waiting_until;
+  const indeterminate = searching && p.videos_done === 0;
   const bar = $("bar");
-  bar.classList.toggle("indeterminate", searching);
+  bar.classList.toggle("indeterminate", indeterminate);
   bar.classList.toggle("done", !s.running && s.result?.status === "done");
-  $("barFill").style.width = searching ? "" : `${p.videos_total ? (p.videos_done / p.videos_total) * 100 : 0}%`;
-  $("progressText").textContent = p.videos_total ? `${p.videos_done} / ${p.videos_total} videos` : "";
+  $("barFill").style.width = indeterminate ? "" : `${p.videos_total ? (p.videos_done / p.videos_total) * 100 : 0}%`;
+  $("progressText").textContent = p.videos_total ? `${fmt(p.videos_done)} / ${fmt(p.videos_total)} videos` : "";
   if (p.waiting_until) {
     $("currentVideo").textContent = `Continuing automatically at ${p.waiting_until} (your time). Keep the app open and the computer awake.`;
   } else {
@@ -255,8 +263,9 @@ function render(s) {
   $("statQuota").textContent = fmt(p.quota_used);
 
   if (s.running) {
+    const batch = p.batch ? ` (batch ${fmt(p.batch)})` : "";
     $("phase").textContent = p.waiting_until ? "Waiting for the quota to reset…"
-      : searching ? "Searching for videos…" : "Fetching comments…";
+      : searching ? `Searching for videos…${batch}` : `Fetching comments…${batch}`;
     $("result").hidden = true;
   } else if (s.result) {
     showResult(s.result);

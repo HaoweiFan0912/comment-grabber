@@ -3,6 +3,8 @@
 Comments are written to a CSV file as they arrive, and an Excel copy is made at the end.
 Progress is saved after every page, so a job that stops (Stop button, quota used up, network
 down...) can be continued later without searching again or saving duplicates.
+A single search only reaches about 500 videos, so bigger jobs run in batches: search for a batch,
+collect its comments, then search again over stretches of time, skipping videos already seen.
 Both the web UI (app.py) and the command line (cli.py) use CommentFetcher.
 """
 
@@ -10,6 +12,7 @@ from __future__ import annotations
 
 import csv
 import html
+import math
 import os
 import re
 import threading
@@ -33,8 +36,12 @@ LIST_COST = 1  # quota units per commentThreads.list / comments.list call
 DAILY_QUOTA = 10_000
 MAX_RETRIES = 3
 
-MAX_VIDEOS_LIMIT = 500  # YouTube search only pages through about 500 results
+MAX_VIDEOS_LIMIT = 10_000
 MAX_COMMENTS_LIMIT = 10_000
+BATCH_SIZE = 500  # YouTube search only pages through about 500 results, so bigger jobs run in batches
+SATURATED_RESULTS = 400  # a search that returned this many probably has more that YouTube won't show
+YOUTUBE_START = "2005-04-23"  # the first video on YouTube
+EXCEL_MAX_ROWS = 1_048_575  # Excel's sheet limit, not counting the header row
 
 ORDER_CHOICES = {"relevance": "Relevance", "viewCount": "View count", "date": "Upload date"}
 
@@ -132,6 +139,8 @@ class Progress:
     quota_used: int = 0  # by this job, over all its runs
     current_video: str = ""
     waiting_until: str = ""  # local time the job resumes at, while waiting for the quota to reset
+    batch: int = 0  # current batch number; 0 when the job isn't batched
+    searching: bool = False
 
 
 @dataclass
@@ -277,39 +286,52 @@ class CommentFetcher:
             taken = {job.csv_path for job in unfinished_jobs()}
             self.cp = Checkpoint.new(asdict(opts), str(_new_file_path(folder, opts.topic, taken)))
             self.result.output_path = self.cp.csv_path
+            if opts.max_videos > BATCH_SIZE:
+                self.cp.batched = True
+                self.cp.search_range = [opts.published_after or YOUTUBE_START, opts.published_before or date.today().isoformat()]
             self._log("info", f'Searching YouTube for "{opts.topic}"…')
+            if self.cp.batched:
+                self._log("info", f"{opts.max_videos:,} videos is more than one search can reach, "
+                                  f"so they'll be collected in batches of about {BATCH_SIZE}")
             if self._title_kw:
                 self._log("info", f"Titles must include: {self._title_kw}")
             if self._comment_kw:
                 self._log("info", f"Comments must include: {self._comment_kw}")
         cp = self.cp
-
-        if not cp.search_done:
-            self._search_videos()
-            if not cp.videos:
-                return
-            notes = []
-            if len(cp.videos) < opts.max_videos:
-                notes.append("that's all the search returned")
-            if p.videos_title_rejected:
-                notes.append(f"{p.videos_title_rejected:,} skipped because the title didn't match")
-            note = f" ({'; '.join(notes)})" if notes else ""
-            self._log("info", f"Found {_count(len(cp.videos), 'video')}{note}. Fetching comments…")
-        p.videos_total = len(cp.videos)
-
         self._entry_index = cp.video_index
+        p.videos_total = self._videos_total()
+
+        while True:
+            if not cp.search_done and cp.video_index >= cp.batch_end:
+                self._search_batch()
+            if cp.search_done:
+                cp.batch_end = len(cp.videos)
+            p.videos_total = self._videos_total()
+            self._collect_batch()
+            if cp.search_done:
+                return
+
+    def _collect_batch(self) -> None:
+        cp = self.cp
+        if cp.video_index >= cp.batch_end:
+            return
         with open(cp.csv_path, "a", newline="", encoding="utf-8-sig") as self._out:
             self._writer = csv.DictWriter(self._out, fieldnames=CSV_COLUMNS)
             if self._out.tell() == 0:
                 self._writer.writeheader()
-            while cp.video_index < len(cp.videos):
+            while cp.video_index < cp.batch_end:
                 self._check_stop()
                 self._process_video(cp.video_index)
                 cp.video_index += 1
                 cp.video_page_token, cp.video_scanned = "", 0
                 self._save_checkpoint()
 
-    def _search_videos(self) -> None:
+    def _videos_total(self) -> int:
+        cp = self.cp
+        return self.options.max_videos if cp.batched and not cp.search_done else len(cp.videos)
+
+    def _search_batch(self) -> None:
+        """Search until the next batch of videos is ready, or there's nothing left to find."""
         cp, opts, p = self.cp, self.options, self.progress
         query = opts.topic
         if self._title_kw:
@@ -323,13 +345,18 @@ class CommentFetcher:
             "maxResults": 50,
             "relevanceLanguage": opts.language,
             "regionCode": opts.region,
-            "publishedAfter": f"{opts.published_after}T00:00:00Z" if opts.published_after else "",
-            "publishedBefore": f"{opts.published_before}T23:59:59Z" if opts.published_before else "",
         }
+        p.searching = True
+        if cp.batched:
+            p.batch = cp.batches_done + 1
+        target = min(cp.batch_end + BATCH_SIZE, opts.max_videos)
         seen = set(cp.seen_video_ids)
         restarted = False
-        while len(cp.videos) < opts.max_videos:
+        while len(cp.videos) < target:
             self._check_stop()
+            start, end = cp.search_window or (opts.published_after, opts.published_before)
+            params["publishedAfter"] = f"{start}T00:00:00Z" if start else ""
+            params["publishedBefore"] = f"{end}T23:59:59Z" if end else ""
             try:
                 data = self._get("search", {**params, "pageToken": cp.search_page_token}, cost=SEARCH_COST)
             except ApiError as e:
@@ -340,6 +367,7 @@ class CommentFetcher:
                     continue
                 raise FatalError(f"Search failed: {e}") from None
             items = data.get("items", [])
+            cp.window_results += len(items)
             for item in items:
                 video_id = item.get("id", {}).get("videoId")
                 if not video_id or video_id in seen:
@@ -360,18 +388,66 @@ class CommentFetcher:
             if self._title_kw:
                 self._log("info", f"Checked {_count(len(seen), 'search result')}, {len(cp.videos):,} with matching titles")
             cp.search_page_token = data.get("nextPageToken", "")
-            if not items or not cp.search_page_token:
+            if (not items or not cp.search_page_token) and not self._next_window():
+                cp.search_done = True
                 break
             self._save_checkpoint()
+
         del cp.videos[opts.max_videos:]
-        cp.search_done = True
+        if len(cp.videos) >= opts.max_videos:
+            cp.search_done = True
+        found = len(cp.videos) - cp.batch_end
+        cp.batch_end = len(cp.videos)
+        if found:
+            cp.batches_done += 1
+        p.searching = False
         self._save_checkpoint()
+        self._log_found(found)
+
+    def _next_window(self) -> bool:
+        """Move on to the next stretch of time to search. Returns False when there's none left."""
+        cp = self.cp
+        if not cp.batched:
+            return False
+        current = cp.search_window or cp.search_range
+        if cp.window_results >= SATURATED_RESULTS and _days_in(current) > 1:
+            cp.saturated_windows.append(current)
+        cp.window_results = 0
+        if not cp.pending_windows and cp.saturated_windows:
+            # Only windows with more than YouTube would show are worth looking at more closely
+            remaining = self.options.max_videos - len(cp.videos)
+            parts = max(2, math.ceil(remaining / (BATCH_SIZE * len(cp.saturated_windows))))
+            cp.pending_windows = [w for window in cp.saturated_windows for w in _split_window(window, parts)]
+            cp.saturated_windows = []
+        if not cp.pending_windows:
+            return False
+        cp.search_window = cp.pending_windows.pop(0)
+        self._log("info", f"Searching videos published {cp.search_window[0]} to {cp.search_window[1]}…")
+        return True
+
+    def _log_found(self, found: int) -> None:
+        cp, opts, p = self.cp, self.options, self.progress
+        rejected = f"{p.videos_title_rejected:,} skipped because the title didn't match"
+        if cp.batched:
+            if found:
+                note = f" ({rejected} so far)" if p.videos_title_rejected else ""
+                self._log("info", f"Batch {p.batch}: found {_count(found, 'new video')}{note}. Fetching comments…")
+            if cp.search_done and len(cp.videos) < opts.max_videos:
+                self._log("warn", f"YouTube's search has no more new videos: found {len(cp.videos):,} of the {opts.max_videos:,} you asked for")
+        elif cp.videos:
+            notes = []
+            if len(cp.videos) < opts.max_videos:
+                notes.append("that's all the search returned")
+            if p.videos_title_rejected:
+                notes.append(rejected)
+            note = f" ({'; '.join(notes)})" if notes else ""
+            self._log("info", f"Found {_count(len(cp.videos), 'video')}{note}. Fetching comments…")
 
     def _process_video(self, index: int) -> None:
         cp, p = self.cp, self.progress
         video = cp.videos[index]
         p.current_video = video["title"]
-        label = f'[{index + 1}/{len(cp.videos)}] "{video["title"]}"'
+        label = f'[{index + 1:,}/{p.videos_total:,}] "{video["title"]}"'
         # Only the first video after a (re)start can already have rows in the CSV
         self._saved_ids = self._load_saved_ids(video["id"]) if index == self._entry_index else set()
         scanned_before, comments_before, replies_before = p.comments_scanned, p.comments, p.replies
@@ -588,6 +664,7 @@ class CommentFetcher:
     def _end(self, status: str, message: str) -> FetchResult:
         cp, p = self.cp, self.progress
         p.waiting_until = ""
+        p.searching = False
         csv_exists = bool(self.result.output_path) and Path(self.result.output_path).exists()
         if status == "done" and not csv_exists:
             status, message = "empty", self._empty_message()
@@ -610,10 +687,11 @@ class CommentFetcher:
 
     def _resume_message(self) -> str:
         cp, p = self.cp, self.progress
-        if not cp.search_done:
-            text = f'Continuing "{cp.options.get("topic")}": picking the search back up ({len(cp.videos):,} matching videos so far)…'
+        if not cp.search_done and cp.video_index >= cp.batch_end:
+            text = (f'Continuing "{cp.options.get("topic")}": picking the search back up '
+                    f"({len(cp.videos):,} videos found so far, {_count(p.comments, 'comment')} saved)…")
         else:
-            text = (f'Continuing "{cp.options.get("topic")}": {p.videos_done:,} of {_count(len(cp.videos), "video")} '
+            text = (f'Continuing "{cp.options.get("topic")}": {p.videos_done:,} of {_count(self._videos_total(), "video")} '
                     f"finished, {_count(p.comments, 'comment')} saved so far…")
         if p.comments + p.replies and not Path(cp.csv_path).exists():
             text += f" Note: the CSV file from earlier runs is missing, so new comments go into a new file at {cp.csv_path}"
@@ -622,14 +700,20 @@ class CommentFetcher:
     def _export_excel(self) -> None:
         self._log("info", "Creating the Excel file…")
         try:
-            self.result.excel_path = str(csv_to_excel(Path(self.result.output_path)))
+            excel_path, left_out = csv_to_excel(Path(self.result.output_path))
+            self.result.excel_path = str(excel_path)
+            if left_out:
+                self._log("warn", f"An Excel sheet holds at most {EXCEL_MAX_ROWS:,} rows, so the Excel file leaves out "
+                                  f"the last {left_out:,}. The CSV file has everything")
         except Exception as e:  # Excel is just for convenience; the CSV is complete either way
             self._log("warn", f"Couldn't create the Excel file ({e}); the CSV file is fine")
 
     def _summary(self) -> str:
-        p = self.progress
-        total = len(self.cp.videos) if self.cp else p.videos_total
+        cp, p = self.cp, self.progress
+        total = self._videos_total()
         finished = _count(total, "video") if p.videos_done >= total else f"{p.videos_done:,} of {_count(total, 'video')}"
+        if cp.batched and cp.search_done and total < self.options.max_videos:
+            finished += f" (you asked for {self.options.max_videos:,}, but YouTube's search found no more)"
         parts = [f"Finished {finished}"]
         if self._comment_kw:
             parts.append(f"checked {_count(p.comments_scanned, 'comment')}")
@@ -664,11 +748,29 @@ def _restore_progress(data: dict) -> Progress:
     known = {f.name for f in fields(Progress)}
     progress = Progress(**{k: v for k, v in data.items() if k in known})
     progress.current_video = progress.waiting_until = ""
+    progress.searching = False
     return progress
 
 
-def csv_to_excel(csv_path: Path) -> Path:
-    """Convert the CSV to .xlsx.
+def _days_in(window: list) -> int:
+    return (date.fromisoformat(window[1]) - date.fromisoformat(window[0])).days + 1
+
+
+def _split_window(window: list, parts: int) -> list:
+    """Split a [first day, last day] window into equal windows that don't overlap, newest first."""
+    first = date.fromisoformat(window[0])
+    days = _days_in(window)
+    parts = min(parts, days)
+    windows = []
+    for i in range(parts - 1, -1, -1):
+        start = first + timedelta(days=days * i // parts)
+        end = first + timedelta(days=days * (i + 1) // parts - 1)
+        windows.append([start.isoformat(), end.isoformat()])
+    return windows
+
+
+def csv_to_excel(csv_path: Path) -> tuple:
+    """Convert the CSV to .xlsx. Returns the file's path and how many rows didn't fit in the sheet.
 
     When Excel opens a CSV it treats text starting with @, -, + or = as a formula (an author named
     @someone shows up as #NAME?). In .xlsx every text cell is stored as text, so that can't happen.
@@ -695,7 +797,12 @@ def csv_to_excel(csv_path: Path) -> Path:
             header_cells.append(cell)
         ws.append(header_cells)
         numeric = [name in NUMERIC_COLUMNS for name in header]
+        written = left_out = 0
         for row in reader:
+            if written >= EXCEL_MAX_ROWS:
+                left_out += 1
+                continue
+            written += 1
             cells = []
             for value, is_number in zip(row, numeric):
                 if is_number and value.isdigit():
@@ -708,7 +815,7 @@ def csv_to_excel(csv_path: Path) -> Path:
 
     excel_path = csv_path.with_suffix(".xlsx")
     wb.save(excel_path)
-    return excel_path
+    return excel_path, left_out
 
 
 def _prepare_folder(output_dir: str) -> Path:

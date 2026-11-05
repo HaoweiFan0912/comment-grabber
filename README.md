@@ -28,6 +28,23 @@ Or run it from a terminal:
 
 Run it without arguments to be asked for the topic and folder. Use `--help` to see every option (sort order, keyword filters, language, region, date range, replies, waiting for the quota).
 
+## More than 500 videos
+
+One YouTube search only reaches about 500 results, so when you ask for more (up to 10,000) the app works in batches:
+
+1. The first batch searches your whole date range with your chosen sort order.
+2. Later batches search stretches of that date range, newest first, with the same sort order. If there still aren't enough videos, stretches that had more results than YouTube would show are split into smaller ones.
+3. Each batch's comments are collected before the next search starts, so you get data early and the files grow as the job runs.
+
+Every video the search has returned is recorded in the job's progress, so no video is collected twice within a job, even across restarts. Separate jobs don't know about each other, so two jobs can still pick up the same video; `Comment ID` tells duplicates apart if you merge their files.
+
+What to expect:
+
+- The videos are spread across the date range, so this isn't the top N for the topic: YouTube can't rank that far down.
+- Later searches return some videos already seen, and those search pages still cost quota. Budget roughly 1.5 times the search cost, and more with a title filter.
+- If YouTube runs out of videos for the topic, the job ends with what it found and tells you how many that was.
+- A very large job may pass the Excel sheet limit of 1,048,575 rows. The Excel file then stops there and the CSV keeps everything.
+
 ## Big jobs: continuing over several days
 
 Progress is saved after every page of results, so a job that stops for any reason (you press Stop, the daily quota runs out, the network drops, you close the app) can be continued later:
@@ -49,7 +66,7 @@ Saved progress lives in the `state/` folder. **Discard** forgets an unfinished j
 - Matching is literal: no translation or synonyms (`是` doesn't match *Yes*), Simplified and Traditional Chinese are different, and *café* doesn't match *cafe*.
 - Not case-sensitive. Full-width and half-width characters, curly and straight quotes (*don’t* / *don't*) count as the same.
 
-With a title filter, videos whose titles don't match don't count toward "Max videos"; the app keeps paging through search results (up to about 500) until it has enough.
+With a title filter, videos whose titles don't match don't count toward "Max videos"; the app keeps paging through search results until it has enough. For 500 videos or fewer that means one search (up to about 500 results); bigger jobs keep going through later batches.
 
 With a comment filter, "Comments per video" becomes how many comments to **check** per video; only the matching ones are saved. When replies are included, each reply is checked on its own.
 
@@ -76,4 +93,4 @@ The header shows how much quota this app has used today. It can't see use of the
 
 If you regularly need more, apply for a higher quota with Google's *YouTube API Services Audit and Quota Extension Form*. Don't rotate several API keys or Google Cloud projects to get around the limit: YouTube's API policies forbid it, and keys can be suspended.
 
-A single search only reaches about 500 videos, whatever your quota. For more videos on one topic, split the job by date range or use several related topics.
+With 10,000 units a day, searching alone tops out at about 5,000 videos a day and leaves nothing for comments, so jobs of several thousand videos take more than a day. Jobs like that can continue across days: see [Big jobs](#big-jobs-continuing-over-several-days).
